@@ -92,6 +92,9 @@ fn main() {
     #[cfg(feature = "logging")]
     pretty_env_logger::init();
 
+    // Get the full target triple to distinguish between wasm32-wasi and wasm32-unknown-unknown
+    let target = env::var("TARGET").unwrap_or_default();
+
     let features = [
         "bindgen",
         "update-bindings",
@@ -189,20 +192,95 @@ fn main() {
     }
 
     if target_os == "wasi" {
-        // pretend we're emscripten - there are already ifdefs that match
-        // also, wasi doesn't ahve FE_DOWNWARD or FE_UPWARD
+        // For WASI, pretend we're emscripten and define FE flags
+        defines.push(("EMSCRIPTEN".into(), Some("1")));
+        defines.push(("FE_DOWNWARD".into(), Some("0")));
+        defines.push(("FE_UPWARD".into(), Some("0")));
+    } else if target == "wasm32-unknown-unknown" {
+        // For wasm32-unknown-unknown, only pretend we're emscripten
+        // FE flags are handled by the fenv.h stub
+        defines.push(("EMSCRIPTEN".into(), Some("1")));
+    } else if target_os == "unknown" {
+        // Fallback for other unknown OS, treat like WASI for now
         defines.push(("EMSCRIPTEN".into(), Some("1")));
         defines.push(("FE_DOWNWARD".into(), Some("0")));
         defines.push(("FE_UPWARD".into(), Some("0")));
     }
 
+    // if target_os == "unknown" {
+    //     defines.push(("EMSCRIPTEN".into(), Some("1")));
+    //     defines.push(("FE_DOWNWARD".into(), Some("0")));
+    //     defines.push(("FE_UPWARD".into(), Some("0")));
+    //     env::set_var("CC", "emcc");
+    //     env::set_var("AR", "emar");
+    //
+    //
+    // }
     for file in source_files.iter().chain(header_files.iter()) {
         fs::copy(src_dir.join(file), out_dir.join(file))
             .expect("Unable to copy source; try 'git submodule update --init'");
     }
     fs::copy("quickjs.bind.h", out_dir.join("quickjs.bind.h")).expect("Unable to copy source");
 
-    if target_os == "wasi" {
+    // Handle different wasm targets differently
+    if target == "wasm32-wasi" {
+        // For wasm32-wasi target, use the WASI SDK
+        let wasi_sdk_path = get_wasi_sdk_path();
+        if !wasi_sdk_path.try_exists().unwrap() {
+            panic!(
+                "wasi-sdk not installed in specified path of {}",
+                wasi_sdk_path.display()
+            );
+        }
+        env::set_var("CC", wasi_sdk_path.join("bin/clang").to_str().unwrap());
+        env::set_var("AR", wasi_sdk_path.join("bin/ar").to_str().unwrap());
+        let sysroot = format!(
+            "--sysroot={}",
+            wasi_sdk_path.join("share/wasi-sysroot").display()
+        );
+        env::set_var("CFLAGS", &sysroot);
+        bindgen_cflags.push(sysroot);
+    } else if target == "wasm32-unknown-unknown" {
+        // For wasm32-unknown-unknown target, use WASI SDK headers + our custom stubs
+        let wasi_sdk_path = get_wasi_sdk_path();
+        let wasi_sysroot_path = wasi_sdk_path.join("share/wasi-sysroot");
+        let stub_include_path =
+            PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("wasm-stubs/include");
+
+        if !wasi_sysroot_path.exists() {
+            panic!("WASI sysroot not found at {}", wasi_sysroot_path.display());
+        }
+        if !stub_include_path.exists() {
+            panic!(
+                "Could not find wasm-stubs/include directory at {:?}",
+                stub_include_path
+            );
+        }
+
+        println!("Using WASI sysroot: {}", wasi_sysroot_path.display());
+        println!("Using wasm stubs (priority): {:?}", stub_include_path);
+
+        // Set compiler and archiver from WASI SDK
+        env::set_var("CC", wasi_sdk_path.join("bin/clang").to_str().unwrap());
+        env::set_var("AR", wasi_sdk_path.join("bin/ar").to_str().unwrap());
+
+        // Add include paths: custom stubs first, then WASI sysroot include
+        builder.include(&stub_include_path);
+        builder.include(wasi_sysroot_path.join("include"));
+        // Add sysroot flag for the compiler
+        let sysroot_flag = format!("--sysroot={}", wasi_sysroot_path.display());
+        builder.flag(&sysroot_flag);
+
+        // Add include paths for bindgen, custom stubs first
+        bindgen_cflags.push(format!("-I{}", stub_include_path.display()));
+        bindgen_cflags.push(format!("-I{}", wasi_sysroot_path.join("include").display()));
+        // Add sysroot flag for bindgen's clang invocation
+        bindgen_cflags.push(sysroot_flag);
+
+        // No explicit libc linking needed for wasm32-unknown-unknown
+    } else if target_os == "wasi" || target_os == "unknown" {
+        // Fallback for other wasm targets, use WASI SDK (original wasi logic)
+        // Note: This might need adjustment if other 'unknown' OS targets appear besides wasm32-unknown-unknown
         let wasi_sdk_path = get_wasi_sdk_path();
         if !wasi_sdk_path.try_exists().unwrap() {
             panic!(
@@ -298,6 +376,7 @@ where
     let target = env::var("TARGET").unwrap();
     let out_dir = out_dir.as_ref();
     let header_file = header_file.as_ref();
+    eprintln!("TARGET {:?}", target);
 
     let mut cflags = vec![format!("--target={}", target)];
     cflags.append(&mut add_cflags);
@@ -327,8 +406,15 @@ where
         .opaque_type("FILE")
         .blocklist_type("FILE")
         .blocklist_function("JS_DumpMemoryUsage");
+    eprintln!("{:?}", env::var("CARGO_CFG_TARGET_OS").unwrap());
 
-    if env::var("CARGO_CFG_TARGET_OS").unwrap() == "wasi" {
+    // Add appropriate flags based on the specific target
+    if target == "wasm32-unknown-unknown" {
+        // Special handling for wasm32-unknown-unknown
+        builder = builder.clang_arg("-fvisibility=default");
+    } else if env::var("CARGO_CFG_TARGET_OS").unwrap() == "wasi"
+        || env::var("CARGO_CFG_TARGET_OS").unwrap() == "unknown"
+    {
         builder = builder.clang_arg("-fvisibility=default");
     }
 
@@ -347,5 +433,8 @@ where
 
         let dest_file = format!("{}.rs", target);
         fs::copy(&bindings_file, dest_dir.join(dest_file)).unwrap();
+
+        // Only panic when updating bindings to halt the build process
+        panic!("bindings generated");
     }
 }
